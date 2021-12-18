@@ -10,12 +10,14 @@ service LeaderElectionService {
 
 message ProbeMessage {
   uint64 sender_id = 1;
+  bool headed_left = 2;
 }
 
 message ProbeResponse {}
 
 message NotifyMessage {
   uint64 leader_id = 1;
+  bool headed_left = 2;
 }
 
 message NotifyResponse {}
