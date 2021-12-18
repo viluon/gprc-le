@@ -1,0 +1,23 @@
+
+syntax = "proto3";
+
+package me.viluon.le;
+
+service LeaderElectionService {
+  rpc Probe(ElectionProbe) returns (ProbeResponse) {}
+  rpc NotifyElected(ElectionNotify) returns (NotifyResponse) {}
+}
+
+message ElectionProbe {
+  int64 sender_id = 1;
+}
+
+message ProbeResponse {
+}
+
+message ElectionNotify {
+  int64 leader_id = 1;
+}
+
+message NotifyResponse {
+}
