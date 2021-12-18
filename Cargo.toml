@@ -1,0 +1,20 @@
+[package]
+name = "grpc-sum"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "grpc-sum-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "grpc-sum-client"
+path = "src/client.rs"
+
+[dependencies]
+tonic = "0.6.1"
+prost = "0.9"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+
+[build-dependencies]
+tonic-build = "0.6"

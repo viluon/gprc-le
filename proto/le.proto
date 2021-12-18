@@ -4,20 +4,18 @@ syntax = "proto3";
 package me.viluon.le;
 
 service LeaderElectionService {
-  rpc Probe(ElectionProbe) returns (ProbeResponse) {}
-  rpc NotifyElected(ElectionNotify) returns (NotifyResponse) {}
+  rpc Probe(ProbeMessage) returns (ProbeResponse) {}
+  rpc NotifyElected(NotifyMessage) returns (NotifyResponse) {}
 }
 
-message ElectionProbe {
-  int64 sender_id = 1;
+message ProbeMessage {
+  uint64 sender_id = 1;
 }
 
-message ProbeResponse {
+message ProbeResponse {}
+
+message NotifyMessage {
+  uint64 leader_id = 1;
 }
 
-message ElectionNotify {
-  int64 leader_id = 1;
-}
-
-message NotifyResponse {
-}
+message NotifyResponse {}
