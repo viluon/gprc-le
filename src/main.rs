@@ -20,16 +20,16 @@ pub struct Node {
     state: Arc<Mutex<NodeState>>
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum NodeState {
-    Candidate { phase: u64 },
+    Candidate { phase: u64, last_phase_probed: u64 },
     Defeated { leader: Option<u64> },
     Leader,
 }
 
 impl Default for NodeState {
     fn default() -> Self {
-        NodeState::Candidate { phase: 1 }
+        NodeState::Candidate { phase: 1, last_phase_probed: 0 }
     }
 }
 
@@ -37,8 +37,8 @@ impl Node {
     fn next_phase(&self) {
         let mut state = self.state.lock().unwrap();
         match *state {
-            NodeState::Candidate { phase } => {
-                *state = NodeState::Candidate { phase: phase + 1 };
+            NodeState::Candidate { phase, last_phase_probed } => {
+                *state = NodeState::Candidate { phase: phase + 1, last_phase_probed };
             },
             _ => panic!("next_phase() called on non-candidate node ({:?})", *state)
         }
@@ -48,7 +48,7 @@ impl Node {
         let mut state = self.state.lock().unwrap();
         match *state {
             NodeState::Candidate { .. } =>
-                *state = NodeState::Defeated { leader: Some(self.id) },
+                *state = NodeState::Defeated { leader: None },
             NodeState::Defeated { .. } => (),
             NodeState::Leader => panic!("defeat() called on the leader node ({:?})", *state),
         }
@@ -78,12 +78,23 @@ impl Node {
 impl LeaderElectionService for Node {
     async fn probe(&self, request: Request<ProbeMessage>)
     -> Result<Response<ProbeResponse>, Status> {
+        println!("node {} server waiting for lock", self.id);
         let state = self.state.lock().unwrap().clone();
 
         match state {
-            NodeState::Candidate { .. } => {
+            NodeState::Candidate { phase, last_phase_probed } => {
                 use std::cmp::Ordering;
                 let ProbeMessage { sender_id, .. } = request.into_inner();
+                if last_phase_probed < phase {
+                    loop {
+                        sleep(Duration::from_millis(50)).await;
+                        let state = self.state.lock().unwrap();
+                        match *state {
+                            NodeState::Candidate { phase, .. } => if phase == last_phase_probed { break; },
+                            _ => unreachable!("we only change the state via probe(), which is being called")
+                        }
+                    }
+                }
                 match self.id.cmp(&sender_id) {
                     Ordering::Less => self.next_phase(),
                     Ordering::Equal => self.lead(),
@@ -102,6 +113,7 @@ impl LeaderElectionService for Node {
             }
         }
 
+        println!("node {} server returning", self.id);
         Ok(Response::new(ProbeResponse {}))
     }
 
@@ -124,8 +136,6 @@ impl LeaderElectionService for Node {
 }
 
 async fn node_client(node: Node) -> Option<()> {
-    let mut last_phase = 0;
-
     sleep(Duration::from_millis(200)).await;
     let mut left = LeaderElectionServiceClient::connect(node.left_addr.clone()).await.ok()?;
     let mut right = LeaderElectionServiceClient::connect(node.right_addr.clone()).await.ok()?;
@@ -133,22 +143,29 @@ async fn node_client(node: Node) -> Option<()> {
     loop {
         let state = node.state.lock().unwrap().clone();
         match state {
-            NodeState::Candidate { phase } if last_phase != phase => {
+            NodeState::Candidate { phase, last_phase_probed } if last_phase_probed != phase => {
                 let headed_left = phase % 2 == 0;
                 let (target, addr) =
                     if headed_left { (&mut left, &node.left_addr[..]) } else { (&mut right, &node.right_addr[..]) };
-
-                println!("node {} sending probe to {} (phase {})", node.id, addr, phase);
-                match target.probe(ProbeMessage { sender_id: node.id, headed_left }).await {
-                    Ok(_) => (),
-                    Err(e) => eprintln!("node {} failed to probe {}: {}", node.id, addr, e),
+                let res = {
+                    let mut state = node.state.lock().unwrap();
+                    if *state == (NodeState::Candidate { phase, last_phase_probed }) {
+                        // FIXME: what if multiple phases were missed?
+                        *state = NodeState::Candidate { phase, last_phase_probed: phase };
+                        true
+                    } else {
+                        // the state changed since last read, abort
+                        false
+                    }
+                };
+                if res {
+                    println!("node {} sending probe to {} (phase {})", node.id, addr, phase);
+                    target.probe(ProbeMessage { sender_id: node.id, headed_left }).await.ok()?;
                 }
-                println!("node {} ok", node.id);
-                last_phase = phase;
                 Some(())
             },
             NodeState::Candidate { .. } => {
-                // FIXME busy wait
+                sleep(Duration::from_millis(50)).await;
                 Some(())
             },
             NodeState::Defeated { .. } => {
