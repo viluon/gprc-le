@@ -1,6 +1,6 @@
 
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use tokio::time::{sleep, Duration};
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -34,21 +34,19 @@ impl Default for NodeState {
 }
 
 impl Node {
-    fn next_phase(&self) {
-        let mut state = self.state.lock().unwrap();
-        match *state {
+    fn next_phase(&self, state: &mut MutexGuard<NodeState>) {
+        match **state {
             NodeState::Candidate { phase, last_phase_probed } => {
-                *state = NodeState::Candidate { phase: phase + 1, last_phase_probed };
+                **state = NodeState::Candidate { phase: phase + 1, last_phase_probed };
             },
             _ => panic!("next_phase() called on non-candidate node ({:?})", *state)
         }
     }
 
-    fn defeat(&self) {
-        let mut state = self.state.lock().unwrap();
-        match *state {
+    fn defeat(&self, state: &mut MutexGuard<NodeState>) {
+        match **state {
             NodeState::Candidate { .. } =>
-                *state = NodeState::Defeated { leader: None },
+                **state = NodeState::Defeated { leader: None },
             NodeState::Defeated { .. } => (),
             NodeState::Leader => panic!("defeat() called on the leader node ({:?})", *state),
         }
@@ -64,11 +62,10 @@ impl Node {
         }
     }
 
-    fn lead(&self) {
-        let mut state = self.state.lock().unwrap();
-        match *state {
+    fn lead(&self, state: &mut MutexGuard<NodeState>) {
+        match **state {
             NodeState::Leader => (),
-            NodeState::Candidate { .. } => *state = NodeState::Leader,
+            NodeState::Candidate { .. } => **state = NodeState::Leader,
             NodeState::Defeated { .. } => panic!("lead() called on a defeated node ({:?})", *state),
         }
     }
@@ -82,23 +79,24 @@ impl LeaderElectionService for Node {
         let state = self.state.lock().unwrap().clone();
 
         match state {
-            NodeState::Candidate { phase, last_phase_probed } => {
+            NodeState::Candidate { .. } => {
                 use std::cmp::Ordering;
                 let ProbeMessage { sender_id, .. } = request.into_inner();
-                if last_phase_probed < phase {
-                    loop {
-                        sleep(Duration::from_millis(50)).await;
-                        let state = self.state.lock().unwrap();
-                        match *state {
-                            NodeState::Candidate { phase, .. } => if phase == last_phase_probed { break; },
-                            _ => unreachable!("we only change the state via probe(), which is being called")
-                        }
+                loop {
+                    sleep(Duration::from_millis(50)).await;
+                    let mut state = self.state.lock().unwrap();
+                    match *state {
+                        NodeState::Candidate { phase, last_phase_probed } if phase == last_phase_probed => {
+                            match self.id.cmp(&sender_id) {
+                                Ordering::Less => self.next_phase(&mut state),
+                                Ordering::Equal => self.lead(&mut state),
+                                Ordering::Greater => self.defeat(&mut state),
+                            };
+                            break
+                        },
+                        NodeState::Candidate { .. } => (),
+                        _ => break // FIXME: should forward the message
                     }
-                }
-                match self.id.cmp(&sender_id) {
-                    Ordering::Less => self.next_phase(),
-                    Ordering::Equal => self.lead(),
-                    Ordering::Greater => self.defeat(),
                 }
             },
             _ => {
@@ -121,6 +119,7 @@ impl LeaderElectionService for Node {
     -> Result<Response<NotifyResponse>, Status> {
         let NotifyMessage { leader_id, headed_left } = request.into_inner();
         if self.id != leader_id {
+            println!("node {} acknowledging {}'s leadership", self.id, leader_id);
             self.defeat_with_leader(leader_id);
 
             // forward the message
@@ -184,34 +183,42 @@ async fn node_client(node: Node) -> Option<()> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use futures::future;
+    use std::io::stdin;
 
-    let first_port = 50000u16;
-    let node_ids = (0u16 .. 3).collect::<Vec<_>>();
-    let get_addr = |id: u16| format!("[::1]:{}", first_port + id);
+    loop {
+        let mut buffer = String::new();
+        stdin().read_line(&mut buffer)?;
 
-    let mut futures = vec![];
-    for (i, &node_id) in node_ids.iter().enumerate() {
-        let prev_id = node_ids[(node_ids.len() + i - 1) % node_ids.len()];
-        let next_id = node_ids[(i + 1) % node_ids.len()];
+        let node_ids = buffer
+            .split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect::<Vec<_>>();
 
-        println!("node {} listening on {}", node_id, get_addr(node_id));
-        let node = Node {
-            id: node_id.into(),
-            left_addr: "http://".to_string() + &get_addr(prev_id),
-            right_addr: "http://".to_string() + &get_addr(next_id),
-            state: Arc::default(),
-        };
+        let first_port = 50000u16;
+        let get_addr = |id: u16| format!("[::1]:{}", first_port + id);
 
-        let server = Server::builder()
-            .add_service(LeaderElectionServiceServer::new(node.clone()))
-            .serve(get_addr(node_id).parse().unwrap());
+        let mut futures = vec![];
+        for (i, &node_id) in node_ids.iter().enumerate() {
+            let prev_id = node_ids[(node_ids.len() + i - 1) % node_ids.len()];
+            let next_id = node_ids[(i + 1) % node_ids.len()];
 
-        futures.push(future::join(server, node_client(node)));
+            println!("node {} listening on {}", node_id, get_addr(node_id));
+            let node = Node {
+                id: node_id.into(),
+                left_addr: "http://".to_string() + &get_addr(prev_id),
+                right_addr: "http://".to_string() + &get_addr(next_id),
+                state: Arc::default(),
+            };
+
+            let server = Server::builder()
+                .add_service(LeaderElectionServiceServer::new(node.clone()))
+                .serve(get_addr(node_id).parse().unwrap());
+
+            futures.push(future::join(server, node_client(node)));
+        }
+
+        tokio::runtime::Runtime::new()?.block_on(async {
+            future::join_all(futures).await;
+        });
     }
-
-    tokio::runtime::Runtime::new()?.block_on(async {
-        future::join_all(futures).await;
-    });
-
-    Ok(())
 }
