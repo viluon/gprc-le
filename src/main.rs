@@ -1,7 +1,7 @@
 #![recursion_limit = "512"]
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::{sleep, Duration};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::{Channel, Server}, Request, Response, Status};
@@ -55,8 +55,8 @@ impl Node {
         }
     }
 
-    fn defeat_with_leader(&self, leader: u64) {
-        let mut state = self.state.lock().unwrap();
+    async fn defeat_with_leader(&self, leader: u64) {
+        let mut state = self.state.lock().await;
         let new_state = NodeState::Defeated { leader: Some(leader) };
         match *state {
             NodeState::Candidate { .. } => *state = new_state,
@@ -83,72 +83,74 @@ impl LeaderElectionService for Node {
     -> Result<Response<Self::ProbeRawStream>, Status> {
         let mut stream = request.into_inner();
 
-        let output = async_stream::try_stream!{
+        let _: async_stream::AsyncStream<Result<ProbeResponse, Status>, _> = async_stream::try_stream!{
             while let Some(req) = stream.next().await {
-                let msg = (req as Result<_, Status>)?;
+                let msg = (req as Result<ProbeMessage, Status>)?;
                 println!("node {} server waiting for lock", self.id);
-                let state = self.state.lock().unwrap().clone();
-
-                match state {
-                    NodeState::Candidate { .. } => {
-                        use std::cmp::Ordering;
-                        let ProbeMessage { sender_id, .. } = msg;
-                        loop {
-                            sleep(Duration::from_millis(50)).await;
-                            let mut state = self.state.lock().unwrap();
-                            match *state {
-                                NodeState::Candidate { phase, last_phase_probed } if phase == last_phase_probed => {
-                                    match self.id.cmp(&sender_id) {
-                                        Ordering::Less => self.next_phase(&mut state),
-                                        Ordering::Equal => self.lead(&mut state),
-                                        Ordering::Greater => self.defeat(&mut state),
-                                    };
-                                    break
-                                },
-                                NodeState::Candidate { .. } => (),
-                                _ => break // FIXME: should forward the message
-                            }
-                        }
-                    },
-                    _ => {
-                        // forward the message
-                        let addr = if msg.headed_left { &self.left_addr } else { &self.right_addr };
-                        if let Ok(mut client) = LeaderElectionServiceClient::connect(addr.clone()).await {
-                            client.probe(msg.sender_id, msg.headed_left).await?;
-                        } else {
-                            eprintln!("couldn't connect to node {}", addr);
-                        }
-                    }
+                let state: NodeState = {
+                    self.state.lock().await.clone()
                 };
+
+                // match state {
+                //     NodeState::Candidate { .. } => {
+                //         use std::cmp::Ordering;
+                //         let ProbeMessage { sender_id, .. } = msg;
+                //         loop {
+                //             sleep(Duration::from_millis(50)).await;
+                //             let mut state = self.state.lock().unwrap();
+                //             match *state {
+                //                 NodeState::Candidate { phase, last_phase_probed } if phase == last_phase_probed => {
+                //                     match self.id.cmp(&sender_id) {
+                //                         Ordering::Less => self.next_phase(&mut state),
+                //                         Ordering::Equal => self.lead(&mut state),
+                //                         Ordering::Greater => self.defeat(&mut state),
+                //                     };
+                //                     break
+                //                 },
+                //                 NodeState::Candidate { .. } => (),
+                //                 _ => break // FIXME: should forward the message
+                //             }
+                //         }
+                //     },
+                //     _ => {
+                //         // forward the message
+                //         let addr = if msg.headed_left { &self.left_addr } else { &self.right_addr };
+                //         if let Ok(mut client) = LeaderElectionServiceClient::connect(addr.clone()).await {
+                //             client.probe(msg.sender_id, msg.headed_left).await?;
+                //         } else {
+                //             eprintln!("couldn't connect to node {}", addr);
+                //         }
+                //     }
+                // };
                 yield ProbeResponse {};
             }
         };
 
         println!("node {} server returning", self.id);
-        Ok(Response::new(Box::pin(output) as Self::ProbeRawStream))
+        Ok(Response::new(Box::pin(stream::empty()) as Self::ProbeRawStream))
     }
 
     async fn notify_elected_raw(&self, request: Request<tonic::Streaming<NotifyMessage>>)
     -> Result<Response<Self::NotifyElectedRawStream>, Status> {
-        let mut stream = request.into_inner();
+        // let mut stream = request.into_inner();
 
-        while let Some(req) = stream.next().await {
-            let NotifyMessage { leader_id, headed_left } = req?;
-            if self.id != leader_id {
-                println!("node {} acknowledging {}'s leadership", self.id, leader_id);
-                self.defeat_with_leader(leader_id);
+        // while let Some(req) = stream.next().await {
+        //     let NotifyMessage { leader_id, headed_left } = req?;
+        //     if self.id != leader_id {
+        //         println!("node {} acknowledging {}'s leadership", self.id, leader_id);
+        //         self.defeat_with_leader(leader_id);
 
-                // forward the message
-                let addr = if headed_left { &self.left_addr } else { &self.right_addr };
-                if let Ok(mut client) = LeaderElectionServiceClient::connect(addr.clone()).await {
-                    client.notify_elected_raw(Request::new(stream::once(async {
-                        NotifyMessage { leader_id, headed_left }
-                    }))).await?;
-                } else {
-                    eprintln!("couldn't connect to node {}", addr);
-                }
-            }
-        }
+        //         // forward the message
+        //         let addr = if headed_left { &self.left_addr } else { &self.right_addr };
+        //         if let Ok(mut client) = LeaderElectionServiceClient::connect(addr.clone()).await {
+        //             client.notify_elected_raw(Request::new(stream::once(async {
+        //                 NotifyMessage { leader_id, headed_left }
+        //             }))).await?;
+        //         } else {
+        //             eprintln!("couldn't connect to node {}", addr);
+        //         }
+        //     }
+        // }
 
         todo!()
         // let out = stream::once(async { Ok(NotifyResponse {})});
@@ -176,27 +178,15 @@ async fn node_client(node: Node) -> Option<()> {
     let mut right = LeaderElectionServiceClient::connect(node.right_addr.clone()).await.ok()?;
 
     loop {
-        let state = node.state.lock().unwrap().clone();
-        match state {
+        let mut state = node.state.lock().await;
+        match *state {
             NodeState::Candidate { phase, last_phase_probed } if last_phase_probed != phase => {
                 let headed_left = phase % 2 == 0;
                 let (target, addr) =
                     if headed_left { (&mut left, &node.left_addr[..]) } else { (&mut right, &node.right_addr[..]) };
-                let res = {
-                    let mut state = node.state.lock().unwrap();
-                    if *state == (NodeState::Candidate { phase, last_phase_probed }) {
-                        // FIXME: what if multiple phases were missed?
-                        *state = NodeState::Candidate { phase, last_phase_probed: phase };
-                        true
-                    } else {
-                        // the state changed since last read, abort
-                        false
-                    }
-                };
-                if res {
-                    println!("node {} sending probe to {} (phase {})", node.id, addr, phase);
-                    target.probe(node.id, headed_left).await.ok()?;
-                }
+                *state = NodeState::Candidate { phase, last_phase_probed: phase };
+                println!("node {} sending probe to {} (phase {})", node.id, addr, phase);
+                target.probe(node.id, headed_left).await.ok()?;
                 Some(())
             },
             NodeState::Candidate { .. } => {
