@@ -1,8 +1,11 @@
-
+#![recursion_limit = "512"]
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard};
 use tokio::time::{sleep, Duration};
-use tonic::{transport::Server, Request, Response, Status};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{transport::{Channel, Server}, Request, Response, Status};
+use futures::{stream, Stream, StreamExt};
 
 use leader_election_service::leader_election_service_server::{LeaderElectionService, LeaderElectionServiceServer};
 use leader_election_service::leader_election_service_client::LeaderElectionServiceClient;
@@ -73,64 +76,97 @@ impl Node {
 
 #[tonic::async_trait]
 impl LeaderElectionService for Node {
-    async fn probe(&self, request: Request<ProbeMessage>)
-    -> Result<Response<ProbeResponse>, Status> {
-        println!("node {} server waiting for lock", self.id);
-        let state = self.state.lock().unwrap().clone();
+    type NotifyElectedRawStream = ReceiverStream<Result<NotifyResponse, Status>>;
+    type ProbeRawStream = Pin<Box<dyn Stream<Item = Result<ProbeResponse, Status>> + Send>>;
 
-        match state {
-            NodeState::Candidate { .. } => {
-                use std::cmp::Ordering;
-                let ProbeMessage { sender_id, .. } = request.into_inner();
-                loop {
-                    sleep(Duration::from_millis(50)).await;
-                    let mut state = self.state.lock().unwrap();
-                    match *state {
-                        NodeState::Candidate { phase, last_phase_probed } if phase == last_phase_probed => {
-                            match self.id.cmp(&sender_id) {
-                                Ordering::Less => self.next_phase(&mut state),
-                                Ordering::Equal => self.lead(&mut state),
-                                Ordering::Greater => self.defeat(&mut state),
-                            };
-                            break
-                        },
-                        NodeState::Candidate { .. } => (),
-                        _ => break // FIXME: should forward the message
+    async fn probe_raw(&self, request: Request<tonic::Streaming<ProbeMessage>>)
+    -> Result<Response<Self::ProbeRawStream>, Status> {
+        let mut stream = request.into_inner();
+
+        let output = async_stream::try_stream!{
+            while let Some(req) = stream.next().await {
+                let msg = (req as Result<_, Status>)?;
+                println!("node {} server waiting for lock", self.id);
+                let state = self.state.lock().unwrap().clone();
+
+                match state {
+                    NodeState::Candidate { .. } => {
+                        use std::cmp::Ordering;
+                        let ProbeMessage { sender_id, .. } = msg;
+                        loop {
+                            sleep(Duration::from_millis(50)).await;
+                            let mut state = self.state.lock().unwrap();
+                            match *state {
+                                NodeState::Candidate { phase, last_phase_probed } if phase == last_phase_probed => {
+                                    match self.id.cmp(&sender_id) {
+                                        Ordering::Less => self.next_phase(&mut state),
+                                        Ordering::Equal => self.lead(&mut state),
+                                        Ordering::Greater => self.defeat(&mut state),
+                                    };
+                                    break
+                                },
+                                NodeState::Candidate { .. } => (),
+                                _ => break // FIXME: should forward the message
+                            }
+                        }
+                    },
+                    _ => {
+                        // forward the message
+                        let addr = if msg.headed_left { &self.left_addr } else { &self.right_addr };
+                        if let Ok(mut client) = LeaderElectionServiceClient::connect(addr.clone()).await {
+                            client.probe(msg.sender_id, msg.headed_left).await?;
+                        } else {
+                            eprintln!("couldn't connect to node {}", addr);
+                        }
                     }
-                }
-            },
-            _ => {
+                };
+                yield ProbeResponse {};
+            }
+        };
+
+        println!("node {} server returning", self.id);
+        Ok(Response::new(Box::pin(output) as Self::ProbeRawStream))
+    }
+
+    async fn notify_elected_raw(&self, request: Request<tonic::Streaming<NotifyMessage>>)
+    -> Result<Response<Self::NotifyElectedRawStream>, Status> {
+        let mut stream = request.into_inner();
+
+        while let Some(req) = stream.next().await {
+            let NotifyMessage { leader_id, headed_left } = req?;
+            if self.id != leader_id {
+                println!("node {} acknowledging {}'s leadership", self.id, leader_id);
+                self.defeat_with_leader(leader_id);
+
                 // forward the message
-                let msg = request.into_inner();
-                let addr = if msg.headed_left { &self.left_addr } else { &self.right_addr };
+                let addr = if headed_left { &self.left_addr } else { &self.right_addr };
                 if let Ok(mut client) = LeaderElectionServiceClient::connect(addr.clone()).await {
-                    client.probe(msg).await?;
+                    client.notify_elected_raw(Request::new(stream::once(async {
+                        NotifyMessage { leader_id, headed_left }
+                    }))).await?;
                 } else {
                     eprintln!("couldn't connect to node {}", addr);
                 }
             }
         }
 
-        println!("node {} server returning", self.id);
-        Ok(Response::new(ProbeResponse {}))
+        todo!()
+        // let out = stream::once(async { Ok(NotifyResponse {})});
+        // Ok(Response::new(Box::pin(out) as Self::NotifyElectedRawStream))
+    }
+}
+
+impl LeaderElectionServiceClient<Channel> {
+    async fn probe(&mut self, sender_id: u64, headed_left: bool) -> Result<(), Status> {
+        let msg = ProbeMessage { sender_id, headed_left };
+        self.probe_raw(Request::new(stream::once(async {
+            msg
+        }))).await?;
+        Ok(())
     }
 
-    async fn notify_elected(&self, request: Request<NotifyMessage>)
-    -> Result<Response<NotifyResponse>, Status> {
-        let NotifyMessage { leader_id, headed_left } = request.into_inner();
-        if self.id != leader_id {
-            println!("node {} acknowledging {}'s leadership", self.id, leader_id);
-            self.defeat_with_leader(leader_id);
-
-            // forward the message
-            let addr = if headed_left { &self.left_addr } else { &self.right_addr };
-            if let Ok(mut client) = LeaderElectionServiceClient::connect(addr.clone()).await {
-                client.notify_elected(NotifyMessage { leader_id, headed_left }).await?;
-            } else {
-                eprintln!("couldn't connect to node {}", addr);
-            }
-        }
-        Ok(Response::new(NotifyResponse {}))
+    async fn notify_elected(&mut self, leader_id: u64, headed_left: bool) -> Result<(), Status> {
+        todo!();
     }
 }
 
@@ -159,7 +195,7 @@ async fn node_client(node: Node) -> Option<()> {
                 };
                 if res {
                     println!("node {} sending probe to {} (phase {})", node.id, addr, phase);
-                    target.probe(ProbeMessage { sender_id: node.id, headed_left }).await.ok()?;
+                    target.probe(node.id, headed_left).await.ok()?;
                 }
                 Some(())
             },
@@ -173,8 +209,8 @@ async fn node_client(node: Node) -> Option<()> {
             },
             NodeState::Leader => {
                 println!("node {} is the leader", node.id);
-                let _ = left.notify_elected(NotifyMessage { leader_id: node.id, headed_left: true }).await.ok()?;
-                let _ = right.notify_elected(NotifyMessage { leader_id: node.id, headed_left: false }).await.ok()?;
+                let _ = left.notify_elected(node.id, true).await.ok()?;
+                let _ = right.notify_elected(node.id, false).await.ok()?;
                 None
             },
         }?
