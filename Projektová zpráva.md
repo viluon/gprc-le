@@ -77,4 +77,7 @@ přeposílání zpráv.
 ### Měření
 
 Měření počtu zpráv najdete v souboru `measurements.csv`. Je také možné je
-vygenerovat Python 3 skriptem `measure.py`.
+vygenerovat Python 3 skriptem `measure.py`. Jednoduchá vizualizce jejich
+závislosti je zde:
+
+![image](https://user-images.githubusercontent.com/7235381/148700040-64b2d035-a217-4cee-8be3-0079f2c9a2ba.png)
