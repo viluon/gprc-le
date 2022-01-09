@@ -14,6 +14,8 @@ pub mod leader_election_service {
     tonic::include_proto!("me.viluon.le");
 }
 
+const DELAY_MODIFIER: u64 = 1000;
+
 #[derive(Debug, Clone)]
 pub struct Node {
     id: u64,
@@ -39,6 +41,7 @@ impl Node {
     fn next_phase(&self, state: &mut MutexGuard<NodeState>) {
         match **state {
             NodeState::Candidate { phase, last_phase_probed } => {
+                assert!(last_phase_probed == phase);
                 **state = NodeState::Candidate { phase: phase + 1, last_phase_probed };
             },
             _ => panic!("next_phase() called on non-candidate node ({:?})", *state)
@@ -50,7 +53,7 @@ impl Node {
             NodeState::Candidate { .. } =>
                 **state = NodeState::Defeated { leader: None },
             NodeState::Defeated { .. } => (),
-            NodeState::Leader => panic!("defeat() called on the leader node ({:?})", *state),
+            NodeState::Leader => panic!("defeat() called on the leader node ({:?})", **state),
         }
     }
 
@@ -95,6 +98,16 @@ impl LeaderElectionService for Node {
                     let mut state: MutexGuard<NodeState> = this.state.lock().await;
                     // println!("node {} server locked!", this.id);
                     match *state {
+                        NodeState::Candidate { phase, .. } if msg.phase > phase => {
+                            println!("node {} server forwarding probe from a future phase to {}", this.id, addr);
+                            future_client.await.unwrap().probe(
+                                format!("node {} server", this.id),
+                                msg.sender_id,
+                                msg.headed_left,
+                                msg.phase,
+                            );
+                            break
+                        },
                         NodeState::Candidate { phase, last_phase_probed } if phase == last_phase_probed => {
                             use std::cmp::Ordering;
                             let ProbeMessage { sender_id, .. } = msg;
@@ -105,14 +118,16 @@ impl LeaderElectionService for Node {
                             };
                             break
                         },
-                        NodeState::Candidate { .. } => (),
+                        NodeState::Candidate { .. } => sleep(Duration::from_millis(DELAY_MODIFIER)).await,
                         _ => {
                             // forward the message
-                            if let Ok(mut client) = future_client.await {
-                                client.probe(msg.sender_id, msg.headed_left);
-                            } else {
-                                eprintln!("couldn't connect to node {}", addr);
-                            }
+                            println!("node {} server forwarding probe to {}", this.id, addr);
+                            future_client.await.unwrap().probe(
+                                format!("node {} server", this.id),
+                                msg.sender_id,
+                                msg.headed_left,
+                                msg.phase,
+                            );
                             break
                         }
                     };
@@ -120,9 +135,10 @@ impl LeaderElectionService for Node {
                 yield ProbeResponse {};
                 println!("node {} server finished processing a probe!", this.id);
             }
+            println!("node {} server closing connection", this.id);
         };
 
-        println!("node {} server returning", self.id);
+        println!("node {} server establishing connection", self.id);
         Ok(Response::new(Box::pin(pipe) as Self::ProbeRawStream))
     }
 
@@ -140,11 +156,8 @@ impl LeaderElectionService for Node {
 
                     // forward the message
                     let addr = if headed_left { &this.left_addr } else { &this.right_addr };
-                    if let Ok(mut client) = LeaderElectionServiceClient::connect(addr.clone()).await {
-                        client.notify_elected(leader_id, headed_left);
-                    } else {
-                        eprintln!("couldn't connect to node {}", addr);
-                    }
+                    LeaderElectionServiceClient::connect(addr.clone()).await.unwrap()
+                        .notify_elected(format!("node {} server", this.id), leader_id, headed_left);
                 };
                 yield NotifyResponse {};
             }
@@ -155,28 +168,36 @@ impl LeaderElectionService for Node {
 }
 
 impl LeaderElectionServiceClient<Channel> {
-    fn probe(mut self, sender_id: u64, headed_left: bool) {
-        let msg = ProbeMessage { sender_id, headed_left };
+    fn probe(mut self, id: String, sender_id: u64, headed_left: bool, phase: u64) {
+        let msg = ProbeMessage { sender_id, headed_left, phase };
         tokio::spawn(async move {
-            self.probe_raw(Request::new(stream::once(async { msg }))).await
+            match self.probe_raw(Request::new(stream::once(async { msg })))
+                .await {
+                    Ok(_) => println!("{} tokio::spawned gRPC call completed", id),
+                    Err(e) => println!("{} tokio::spawned gRPC call failed: {}", id, e)
+                }
         });
     }
 
-    fn notify_elected(mut self, leader_id: u64, headed_left: bool) {
+    fn notify_elected(mut self, id: String, leader_id: u64, headed_left: bool) {
         let msg = NotifyMessage { leader_id, headed_left };
         tokio::spawn(async move {
-            self.notify_elected_raw(Request::new(stream::once(async { msg }))).await
+            match self.notify_elected_raw(Request::new(stream::once(async { msg })))
+                .await {
+                    Ok(_) => println!("{} tokio::spawned gRPC call completed", id),
+                    Err(e) => println!("{} tokio::spawned gRPC call failed: {}", id, e)
+                }
         });
     }
 }
 
 async fn node_client(node: Node) -> Option<()> {
-    sleep(Duration::from_millis(1000)).await;
+    sleep(Duration::from_millis(2 * DELAY_MODIFIER)).await;
     let left = LeaderElectionServiceClient::connect(node.left_addr.clone()).await.ok()?;
     let right = LeaderElectionServiceClient::connect(node.right_addr.clone()).await.ok()?;
 
     loop {
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(DELAY_MODIFIER)).await;
         println!("node {} client waiting for mutex lock", node.id);
         let mut state = node.state.lock().await;
         match *state {
@@ -187,21 +208,19 @@ async fn node_client(node: Node) -> Option<()> {
                 *state = NodeState::Candidate { phase, last_phase_probed: phase };
                 println!("node {} sending probe to {} (phase {})", node.id, addr, phase);
                 // FIXME is this correct?
-                target.clone().probe(node.id, headed_left);
+                target.clone().probe(format!("node {} client", node.id), node.id, headed_left, phase);
                 println!("node {} sent a probe", node.id);
                 Some(())
             },
-            NodeState::Candidate { .. } => {
-                Some(())
-            },
+            NodeState::Candidate { .. } => Some(()),
             NodeState::Defeated { .. } => {
                 println!("node {} is defeated", node.id);
                 None
             },
             NodeState::Leader => {
                 println!("node {} is the leader", node.id);
-                let _ = left.clone().notify_elected(node.id, true);
-                let _ = right.clone().notify_elected(node.id, false);
+                left.clone().notify_elected(format!("node {} client", node.id), node.id, true);
+                // let _ = right.clone().notify_elected(format!("node {} client", node.id), node.id, false);
                 None
             },
         }?
