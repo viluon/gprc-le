@@ -3,6 +3,9 @@ name = "grpc-sum"
 version = "0.1.0"
 edition = "2021"
 
+[profile.dev]
+panic = "abort"
+
 [dependencies]
 async-stream = "0.3.2"
 futures = "0.3"

@@ -14,7 +14,7 @@ pub mod leader_election_service {
     tonic::include_proto!("me.viluon.le");
 }
 
-const DELAY_MODIFIER: u64 = 1000;
+const DELAY_MODIFIER: u64 = 10;
 
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -90,23 +90,27 @@ impl LeaderElectionService for Node {
             println!("node {} server waiting for probes", this.id);
             while let Some(req) = stream.next().await {
                 let msg = (req as Result<ProbeMessage, Status>)?;
+                let mut forwarded = false;
                 let addr = if msg.headed_left { &this.left_addr } else { &this.right_addr };
-                let future_client = LeaderElectionServiceClient::connect(addr.clone());
+                let client = || LeaderElectionServiceClient::connect(addr.clone());
                 println!("node {} server waiting for lock", this.id);
 
                 loop {
                     let mut state: MutexGuard<NodeState> = this.state.lock().await;
                     // println!("node {} server locked!", this.id);
                     match *state {
-                        NodeState::Candidate { phase, .. } if msg.phase > phase => {
+                        // FIXME this reacts differently to the next arm, which
+                        // causes problems if the client's behind but otherwise
+                        // we should really react to this message
+                        NodeState::Candidate { phase, .. } if !forwarded && msg.phase > phase => {
                             println!("node {} server forwarding probe from a future phase to {}", this.id, addr);
-                            future_client.await.unwrap().probe(
+                            client().await.unwrap().probe(
                                 format!("node {} server", this.id),
                                 msg.sender_id,
                                 msg.headed_left,
                                 msg.phase,
                             );
-                            break
+                            forwarded = true;
                         },
                         NodeState::Candidate { phase, last_phase_probed } if phase == last_phase_probed => {
                             use std::cmp::Ordering;
@@ -116,13 +120,14 @@ impl LeaderElectionService for Node {
                                 Ordering::Equal => this.lead(&mut state),
                                 Ordering::Greater => this.defeat(&mut state),
                             };
+                            client().await.unwrap().probe(format!("node {} server", this.id), sender_id, msg.headed_left, msg.phase);
                             break
                         },
                         NodeState::Candidate { .. } => sleep(Duration::from_millis(DELAY_MODIFIER)).await,
                         _ => {
                             // forward the message
                             println!("node {} server forwarding probe to {}", this.id, addr);
-                            future_client.await.unwrap().probe(
+                            client().await.unwrap().probe(
                                 format!("node {} server", this.id),
                                 msg.sender_id,
                                 msg.headed_left,
@@ -260,7 +265,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .add_service(LeaderElectionServiceServer::new(node.clone()))
                 .serve(get_addr(node_id).parse().unwrap());
 
-            futures.push(future::join(server, node_client(node)));
+            futures.push(future::join(async move { server.await.expect("oops") }, node_client(node)));
         }
 
         tokio::runtime::Runtime::new()?.block_on(async {
