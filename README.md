@@ -11,11 +11,8 @@ topology](https://courses.fit.cvut.cz/NI-DSV/lectures/NI-DSV-Prednaska04-LeaderE
   libraries)
   - modelling a node with the client/server model requires synchronisation on
     shared state, which is painful to manage
-  - you can call a gRPC method asynchronously while handling a gRPC request, but
-    the async calls you make this way can't (easily) live past the point you
-    send a response back, meaning message forwarding is awful. You can get
-    around this with bidirectional streaming
-  - bidirectional streaming requires a lot of boilerplate and there's no
+  - bidirectional streaming requires a lot of boilerplate (not in terms of LOC,
+    in terms of concepts that have to come together to enable it) and there's no
     straightforward API for it -- you have to mix features from `tonic`,
     `tokio`, `tokio-stream`, `async-stream`, and `futures`. Some of these crates
     have similar names for different things which can't be mixed up
