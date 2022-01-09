@@ -1,9 +1,8 @@
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::{sleep, Duration};
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::{Channel, Server}, Request, Response, Status};
 use futures::{stream, Stream, StreamExt};
 
@@ -76,85 +75,83 @@ impl Node {
 
 #[tonic::async_trait]
 impl LeaderElectionService for Node {
-    type NotifyElectedRawStream = ReceiverStream<Result<NotifyResponse, Status>>;
+    type NotifyElectedRawStream = Pin<Box<dyn Stream<Item = Result<NotifyResponse, Status>> + Send>>;
     type ProbeRawStream = Pin<Box<dyn Stream<Item = Result<ProbeResponse, Status>> + Send>>;
 
     async fn probe_raw(&self, request: Request<tonic::Streaming<ProbeMessage>>)
     -> Result<Response<Self::ProbeRawStream>, Status> {
         let mut stream = request.into_inner();
 
-        let _: async_stream::AsyncStream<Result<ProbeResponse, Status>, _> = async_stream::try_stream!{
+        let this = self.clone();
+        let pipe: async_stream::AsyncStream<Result<ProbeResponse, Status>, _> = async_stream::try_stream!{
+            println!("node {} server waiting for probes", this.id);
             while let Some(req) = stream.next().await {
                 let msg = (req as Result<ProbeMessage, Status>)?;
-                println!("node {} server waiting for lock", self.id);
-                let state: NodeState = {
-                    self.state.lock().await.clone()
-                };
+                println!("node {} server waiting for lock", this.id);
 
-                // match state {
-                //     NodeState::Candidate { .. } => {
-                //         use std::cmp::Ordering;
-                //         let ProbeMessage { sender_id, .. } = msg;
-                //         loop {
-                //             sleep(Duration::from_millis(50)).await;
-                //             let mut state = self.state.lock().unwrap();
-                //             match *state {
-                //                 NodeState::Candidate { phase, last_phase_probed } if phase == last_phase_probed => {
-                //                     match self.id.cmp(&sender_id) {
-                //                         Ordering::Less => self.next_phase(&mut state),
-                //                         Ordering::Equal => self.lead(&mut state),
-                //                         Ordering::Greater => self.defeat(&mut state),
-                //                     };
-                //                     break
-                //                 },
-                //                 NodeState::Candidate { .. } => (),
-                //                 _ => break // FIXME: should forward the message
-                //             }
-                //         }
-                //     },
-                //     _ => {
-                //         // forward the message
-                //         let addr = if msg.headed_left { &self.left_addr } else { &self.right_addr };
-                //         if let Ok(mut client) = LeaderElectionServiceClient::connect(addr.clone()).await {
-                //             client.probe(msg.sender_id, msg.headed_left).await?;
-                //         } else {
-                //             eprintln!("couldn't connect to node {}", addr);
-                //         }
-                //     }
-                // };
+                loop {
+                    let mut state: MutexGuard<NodeState> = this.state.lock().await;
+                    println!("node {} server locked!", this.id);
+                    match *state {
+                        NodeState::Candidate { phase, last_phase_probed } if phase == last_phase_probed => {
+                            use std::cmp::Ordering;
+                            let ProbeMessage { sender_id, .. } = msg;
+                            match this.id.cmp(&sender_id) {
+                                Ordering::Less => this.next_phase(&mut state),
+                                Ordering::Equal => this.lead(&mut state),
+                                Ordering::Greater => this.defeat(&mut state),
+                            };
+                            break
+                        },
+                        NodeState::Candidate { .. } => (),
+                        _ => {
+                            // forward the message
+                            let addr = if msg.headed_left { &this.left_addr } else { &this.right_addr };
+                            if let Ok(mut client) = LeaderElectionServiceClient::connect(addr.clone()).await {
+                                // FIXME should release the lock before this call
+                                client.probe(msg.sender_id, msg.headed_left).await?;
+                            } else {
+                                eprintln!("couldn't connect to node {}", addr);
+                            }
+                            break
+                        }
+                    };
+                }
                 yield ProbeResponse {};
+                println!("node {} server finished processing a probe!", this.id);
             }
         };
 
         println!("node {} server returning", self.id);
-        Ok(Response::new(Box::pin(stream::empty()) as Self::ProbeRawStream))
+        Ok(Response::new(Box::pin(pipe) as Self::ProbeRawStream))
     }
 
     async fn notify_elected_raw(&self, request: Request<tonic::Streaming<NotifyMessage>>)
     -> Result<Response<Self::NotifyElectedRawStream>, Status> {
-        // let mut stream = request.into_inner();
+        let mut stream = request.into_inner();
 
-        // while let Some(req) = stream.next().await {
-        //     let NotifyMessage { leader_id, headed_left } = req?;
-        //     if self.id != leader_id {
-        //         println!("node {} acknowledging {}'s leadership", self.id, leader_id);
-        //         self.defeat_with_leader(leader_id);
+        let _: async_stream::AsyncStream<Result<NotifyResponse, Status>, _> = async_stream::try_stream!{
+            while let Some(req) = stream.next().await {
+                let NotifyMessage { leader_id, headed_left } = req?;
+                if self.id != leader_id {
+                    println!("node {} acknowledging {}'s leadership", self.id, leader_id);
+                    self.defeat_with_leader(leader_id).await;
 
-        //         // forward the message
-        //         let addr = if headed_left { &self.left_addr } else { &self.right_addr };
-        //         if let Ok(mut client) = LeaderElectionServiceClient::connect(addr.clone()).await {
-        //             client.notify_elected_raw(Request::new(stream::once(async {
-        //                 NotifyMessage { leader_id, headed_left }
-        //             }))).await?;
-        //         } else {
-        //             eprintln!("couldn't connect to node {}", addr);
-        //         }
-        //     }
-        // }
+                    // forward the message
+                    let addr = if headed_left { &self.left_addr } else { &self.right_addr };
+                    if let Ok(mut client) = LeaderElectionServiceClient::connect(addr.clone()).await {
+                        client.notify_elected_raw(Request::new(stream::once(async move {
+                            NotifyMessage { leader_id, headed_left }
+                        }))).await?;
+                    } else {
+                        eprintln!("couldn't connect to node {}", addr);
+                    }
+                };
+                yield NotifyResponse {};
+            }
+        };
 
-        todo!()
-        // let out = stream::once(async { Ok(NotifyResponse {})});
-        // Ok(Response::new(Box::pin(out) as Self::NotifyElectedRawStream))
+        Ok(Response::new(Box::pin(stream::empty()) as Self::NotifyElectedRawStream))
     }
 }
 
@@ -168,29 +165,36 @@ impl LeaderElectionServiceClient<Channel> {
     }
 
     async fn notify_elected(&mut self, leader_id: u64, headed_left: bool) -> Result<(), Status> {
-        todo!();
+        let msg = NotifyMessage { leader_id, headed_left };
+        self.notify_elected_raw(Request::new(stream::once(async {
+            msg
+        }))).await?;
+        Ok(())
     }
 }
 
 async fn node_client(node: Node) -> Option<()> {
-    sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(2000)).await;
     let mut left = LeaderElectionServiceClient::connect(node.left_addr.clone()).await.ok()?;
     let mut right = LeaderElectionServiceClient::connect(node.right_addr.clone()).await.ok()?;
 
     loop {
+        println!("node {} client waiting for mutex lock", node.id);
         let mut state = node.state.lock().await;
         match *state {
             NodeState::Candidate { phase, last_phase_probed } if last_phase_probed != phase => {
                 let headed_left = phase % 2 == 0;
-                let (target, addr) =
-                    if headed_left { (&mut left, &node.left_addr[..]) } else { (&mut right, &node.right_addr[..]) };
+                let (mut target, addr) =
+                    if headed_left { (left.clone(), &node.left_addr[..]) } else { (right.clone(), &node.right_addr[..]) };
                 *state = NodeState::Candidate { phase, last_phase_probed: phase };
                 println!("node {} sending probe to {} (phase {})", node.id, addr, phase);
-                target.probe(node.id, headed_left).await.ok()?;
+                // FIXME is this correct?
+                tokio::spawn(async move { target.probe(node.id, headed_left).await });
+                println!("node {} sent a probe", node.id);
                 Some(())
             },
             NodeState::Candidate { .. } => {
-                sleep(Duration::from_millis(50)).await;
+                sleep(Duration::from_millis(500)).await;
                 Some(())
             },
             NodeState::Defeated { .. } => {
