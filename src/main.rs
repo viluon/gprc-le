@@ -14,7 +14,7 @@ pub mod leader_election_service {
     tonic::include_proto!("me.viluon.le");
 }
 
-const DELAY_MODIFIER: u64 = 10;
+const DELAY_MODIFIER: u64 = 100;
 
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -90,51 +90,36 @@ impl LeaderElectionService for Node {
             println!("node {} server waiting for probes", this.id);
             while let Some(req) = stream.next().await {
                 let msg = (req as Result<ProbeMessage, Status>)?;
-                let mut forwarded = false;
                 let addr = if msg.headed_left { &this.left_addr } else { &this.right_addr };
                 let client = || LeaderElectionServiceClient::connect(addr.clone());
+
+                if msg.sender_id != this.id {
+                    // forward the message
+                    println!("node {} server forwarding probe to {}", this.id, addr);
+                    client().await.unwrap().probe(
+                        format!("node {} server", this.id),
+                        msg.sender_id,
+                        msg.headed_left,
+                        msg.phase,
+                    );
+                }
+
                 println!("node {} server waiting for lock", this.id);
 
                 loop {
                     let mut state: MutexGuard<NodeState> = this.state.lock().await;
-                    // println!("node {} server locked!", this.id);
                     match *state {
-                        // FIXME this reacts differently to the next arm, which
-                        // causes problems if the client's behind but otherwise
-                        // we should really react to this message
-                        NodeState::Candidate { phase, .. } if !forwarded && msg.phase > phase => {
-                            println!("node {} server forwarding probe from a future phase to {}", this.id, addr);
-                            client().await.unwrap().probe(
-                                format!("node {} server", this.id),
-                                msg.sender_id,
-                                msg.headed_left,
-                                msg.phase,
-                            );
-                            forwarded = true;
-                        },
                         NodeState::Candidate { phase, last_phase_probed } if phase == last_phase_probed => {
                             use std::cmp::Ordering;
-                            let ProbeMessage { sender_id, .. } = msg;
-                            match this.id.cmp(&sender_id) {
+                            match this.id.cmp(&msg.sender_id) {
                                 Ordering::Less => this.next_phase(&mut state),
                                 Ordering::Equal => this.lead(&mut state),
                                 Ordering::Greater => this.defeat(&mut state),
                             };
-                            client().await.unwrap().probe(format!("node {} server", this.id), sender_id, msg.headed_left, msg.phase);
                             break
                         },
                         NodeState::Candidate { .. } => sleep(Duration::from_millis(DELAY_MODIFIER)).await,
-                        _ => {
-                            // forward the message
-                            println!("node {} server forwarding probe to {}", this.id, addr);
-                            client().await.unwrap().probe(
-                                format!("node {} server", this.id),
-                                msg.sender_id,
-                                msg.headed_left,
-                                msg.phase,
-                            );
-                            break
-                        }
+                        _ => break,
                     };
                 }
                 yield ProbeResponse {};
@@ -161,6 +146,7 @@ impl LeaderElectionService for Node {
 
                     // forward the message
                     let addr = if headed_left { &this.left_addr } else { &this.right_addr };
+                    println!("node {} forwarding election notification to {}", this.id, addr);
                     LeaderElectionServiceClient::connect(addr.clone()).await.unwrap()
                         .notify_elected(format!("node {} server", this.id), leader_id, headed_left);
                 };
